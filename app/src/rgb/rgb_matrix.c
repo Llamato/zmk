@@ -94,6 +94,7 @@ __attribute__((weak)) RGB rgb_matrix_hsv_to_rgb(HSV hsv) { return hsv_to_rgb(hsv
 // globals
 rgb_config_t rgb_matrix_config;
 uint32_t g_rgb_timer;
+uint8_t g_rgb_waves_scroll;
 
 uint8_t g_rgb_frame_buffer[MATRIX_ROWS][MATRIX_COLS] = {{0}};
 
@@ -140,6 +141,9 @@ void process_rgb_matrix(uint8_t row, uint8_t col, bool pressed) {
 
     if (pressed) {
         led_count = zmk_rgb_matrix_map_row_column_to_led(row, col, led);
+        if (rgb_matrix_config.mode == RGB_EFFECT_WAVES) {
+            g_rgb_waves_scroll++;
+        }
     }
 
     if (last_hit_buffer.count + led_count > LED_HITS_TO_REMEMBER) {

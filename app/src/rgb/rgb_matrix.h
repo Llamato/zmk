@@ -157,6 +157,7 @@ extern _led_indicators rgb_led_indicators;
 extern rgb_config_t rgb_matrix_config;
 
 extern uint32_t g_rgb_timer;
+extern uint8_t g_rgb_waves_scroll;
 extern led_config_t g_led_config;
 
 extern last_hit_t g_last_hit_tracker;

@@ -28,6 +28,7 @@ bool solid_reactive_multiwide(effect_params_t *params);
 bool solid_reactive_multinexus(effect_params_t *params);
 bool splash(effect_params_t *params);
 bool solid_splash(effect_params_t *params);
+bool waves(effect_params_t *params);
 bool rgb_run(effect_params_t *params);
 bool solid_color(effect_params_t *params);
 bool led_eff_indicators(effect_params_t *params);
@@ -116,6 +117,10 @@ rgb_effect_func rgb_effect_funcs[] = {
 #endif
 #ifdef ENABLE_RGB_EFFECT_MIXED_RGB
     mixed_rgb,
+#endif
+
+#ifdef ENABLE_RGB_EFFECT_WAVES
+    waves,
 #endif
 
 #ifdef ENABLE_RGB_EFFECT_RUN
@@ -816,10 +821,58 @@ HSV solid_splash_change(HSV hsv, int16_t dx, int16_t dy, uint8_t dist, uint16_t 
 }
 
 bool solid_splash(effect_params_t *params) {
-    return effect_reactive_splash_calc(qsub8(g_last_hit_tracker.count, 1), params,
-                                       &solid_splash_change);
+    return effect_reactive_splash_calc(qsub8(g_last_hit_tracker.count, 1), params, &solid_splash_change);
 }
 
+#endif
+
+#ifdef ENABLE_RGB_EFFECT_WAVES
+bool waves(effect_params_t *params) {
+    RGB_MATRIX_USE_LIMITS(led_min, led_max);
+
+    static const uint8_t trans_flag_colors[][3] = {
+        {0x5b, 0xce, 0xfa},
+        {0xf5, 0xa9, 0xb8},
+        {0xff, 0xff, 0xff},
+        {0xf5, 0xa9, 0xb8},
+        {0x5b, 0xce, 0xfa},
+    };
+
+    if (params->init) {
+        g_rgb_waves_scroll = 0;
+    }
+    
+    uint8_t scroll = g_rgb_waves_scroll % MATRIX_ROWS;
+
+    for (uint8_t currentRow = 0; currentRow < MATRIX_ROWS; currentRow++) {
+        uint8_t scrolled_row = (currentRow + scroll) % MATRIX_ROWS;
+        uint8_t stripe = (uint16_t)scrolled_row * 5 / MATRIX_ROWS;
+        if (stripe > 4) {
+            stripe = 4;
+        }
+
+        uint8_t led_indices[LED_HITS_TO_REMEMBER];
+        for (uint8_t currentColumn = 0; currentColumn < MATRIX_COLS; currentColumn++) {
+            if (g_led_config.matrix_co[currentRow][currentColumn] == NO_LED) {
+                continue;
+            }
+
+            uint8_t led_count = zmk_rgb_matrix_map_row_column_to_led(currentRow, currentColumn, led_indices);
+            for (uint8_t led_idx = 0; led_idx < led_count; led_idx++) {
+                uint8_t led = led_indices[led_idx];
+                if (led < led_min || led >= led_max) {
+                    continue;
+                }
+                if (!HAS_ANY_FLAGS(g_led_config.flags[led], params->flags)) {
+                    continue;
+                }
+                zmk_rgb_matrix_set_color(led, trans_flag_colors[stripe][0], trans_flag_colors[stripe][1], trans_flag_colors[stripe][2]);
+            }
+        }
+    }
+
+    return zmk_rgb_matrix_check_finished_leds(led_max);
+}
 #endif
 
 #ifdef ENABLE_RGB_EFFECT_RUN
@@ -935,8 +988,7 @@ bool led_eff_indicators(effect_params_t *params) {
 #ifdef NUM_LOCK_INDEX
         if (keyboard_get_led_state().num_lock == 0) {
             if (get_rgb_test_start()) {
-                zmk_rgb_matrix_set_color(NUM_LOCK_INDEX, rgb_led_indicators.rgb[0].r,
-                                         rgb_led_indicators.rgb[0].g, rgb_led_indicators.rgb[0].b);
+                zmk_rgb_matrix_set_color(NUM_LOCK_INDEX, rgb_led_indicators.rgb[0].r, rgb_led_indicators.rgb[0].g, rgb_led_indicators.rgb[0].b);
             } else
                 zmk_rgb_matrix_set_color(NUM_LOCK_INDEX, 0, 0, 0);
         }
