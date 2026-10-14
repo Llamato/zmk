@@ -141,9 +141,11 @@ void process_rgb_matrix(uint8_t row, uint8_t col, bool pressed) {
 
     if (pressed) {
         led_count = zmk_rgb_matrix_map_row_column_to_led(row, col, led);
+#ifdef ENABLE_RGB_EFFECT_WAVES
         if (rgb_matrix_config.mode == RGB_EFFECT_WAVES) {
             g_rgb_waves_scroll++;
         }
+#endif
     }
 
     if (last_hit_buffer.count + led_count > LED_HITS_TO_REMEMBER) {
@@ -173,6 +175,12 @@ void process_rgb_matrix(uint8_t row, uint8_t col, bool pressed) {
         if (rgb_matrix_config.mode == RGB_EFFECT_TYPING_HEATMAP) {
             process_rgb_matrix_typing_heatmap(row, col);
         }
+    }
+#endif
+#ifdef ENABLE_RGB_EFFECT_RIPPLE
+    void process_rgb_matrix_ripple(const uint8_t *leds, uint8_t count);
+    if (pressed && rgb_matrix_config.mode == RGB_EFFECT_RIPPLE) {
+        process_rgb_matrix_ripple(led, led_count);
     }
 #endif
 #ifdef CONFIG_KEYCHRON_RGB_ENABLE

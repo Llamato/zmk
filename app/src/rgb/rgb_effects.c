@@ -29,6 +29,7 @@ bool solid_reactive_multinexus(effect_params_t *params);
 bool splash(effect_params_t *params);
 bool solid_splash(effect_params_t *params);
 bool waves(effect_params_t *params);
+bool ripple(effect_params_t *params);
 bool rgb_run(effect_params_t *params);
 bool solid_color(effect_params_t *params);
 bool led_eff_indicators(effect_params_t *params);
@@ -121,6 +122,10 @@ rgb_effect_func rgb_effect_funcs[] = {
 
 #ifdef ENABLE_RGB_EFFECT_WAVES
     waves,
+#endif
+
+#ifdef ENABLE_RGB_EFFECT_RIPPLE
+    ripple,
 #endif
 
 #ifdef ENABLE_RGB_EFFECT_RUN
@@ -869,6 +874,162 @@ bool waves(effect_params_t *params) {
                 zmk_rgb_matrix_set_color(led, trans_flag_colors[stripe][0], trans_flag_colors[stripe][1], trans_flag_colors[stripe][2]);
             }
         }
+    }
+
+    return zmk_rgb_matrix_check_finished_leds(led_max);
+}
+#endif
+
+#ifdef ENABLE_RGB_EFFECT_RIPPLE
+// a damped 2D wave equation on a grid with RIPPLE_K cells per key with a drop added under every pressed key
+#define RIPPLE_K 4 // simulation cells per key in each direction; can't do 10 i guess
+#define RIPPLE_CELL 12 // LED point units per key
+#define RIPPLE_W ((UINT8_MAX / RIPPLE_CELL + 1) * RIPPLE_K) // 22 keys; outermost cells are a fixed zero border
+#define RIPPLE_H ((64 / RIPPLE_CELL + 1) * RIPPLE_K) // 6 keys
+#define RIPPLE_STEP_MS 15
+#define RIPPLE_MAX_CATCHUP_MS 120
+#define RIPPLE_MAX_PENDING 16
+
+#define RIPPLE_Q(x) ((int32_t)((x) * 65536.0 + 0.5))
+#define RIPPLE_R RIPPLE_Q((0.05 * RIPPLE_K) * (0.05 * RIPPLE_K)) // (c * dt / dx)^2 with dx = 1 / k
+#define RIPPLE_DAMPING RIPPLE_Q(0.99)
+#define RIPPLE_FULL_SCALE RIPPLE_Q(0.4) // vmax of the colormap
+
+// compile-time check; higher number = prolly crash
+BUILD_ASSERT(RIPPLE_K == 4, "ripple_drop is tabulated for RIPPLE_K == 4");
+
+// make_drop() translation with width 0.5 centred on a cell
+static const int32_t ripple_drop[] = {
+    RIPPLE_Q(0.939413), RIPPLE_Q(0.569783), RIPPLE_Q(0.209611), RIPPLE_Q(0.046771),
+    RIPPLE_Q(0.006330), RIPPLE_Q(0.000520), RIPPLE_Q(0.000026),
+};
+#define RIPPLE_DROP_REACH ((int)ARRAY_SIZE(ripple_drop))
+
+static int32_t ripple_grid[2][RIPPLE_H][RIPPLE_W];
+static uint8_t ripple_cur;
+static uint32_t ripple_last_ms;
+static uint32_t ripple_acc;
+
+// key presses arrive on the kscan work queue; the simulation runs on the RGB thread
+static struct k_spinlock ripple_lock;
+static uint8_t ripple_pending[RIPPLE_MAX_PENDING];
+static uint8_t ripple_pending_count;
+
+void process_rgb_matrix_ripple(const uint8_t *leds, uint8_t count) {
+    k_spinlock_key_t key = k_spin_lock(&ripple_lock);
+    for (uint8_t i = 0; i < count && ripple_pending_count < RIPPLE_MAX_PENDING; i++) {
+        ripple_pending[ripple_pending_count++] = leds[i];
+    }
+    k_spin_unlock(&ripple_lock, key);
+}
+
+static void ripple_led_corner(uint8_t led, uint8_t *x, uint8_t *y) {
+    // the cell corner nearest to the LED with LED point 0 at the centre of the first key
+    *x = MIN((g_led_config.point[led].x * RIPPLE_K + RIPPLE_CELL / 2) / RIPPLE_CELL + RIPPLE_K / 2, RIPPLE_W - RIPPLE_K / 2);
+    *y = MIN((g_led_config.point[led].y * RIPPLE_K + RIPPLE_CELL / 2) / RIPPLE_CELL + RIPPLE_K / 2, RIPPLE_H - RIPPLE_K / 2);
+}
+
+static void ripple_add_drop(uint8_t led) {
+    uint8_t cx, cy;
+    ripple_led_corner(led, &cx, &cy);
+
+    for (int dy = -RIPPLE_DROP_REACH; dy < RIPPLE_DROP_REACH; dy++) {
+        int y = cy + dy;
+        //  old combined check per cell cost nothing; now it does
+        if (y < 1 || y > RIPPLE_H - 2) {
+            continue;
+        }
+        int32_t fy = ripple_drop[dy < 0 ? -dy - 1 : dy];
+
+        for (int dx = -RIPPLE_DROP_REACH; dx < RIPPLE_DROP_REACH; dx++) {
+            int x = cx + dx;
+            if (x < 1 || x > RIPPLE_W - 2) {
+                continue;
+            }
+            int32_t fx = ripple_drop[dx < 0 ? -dx - 1 : dx];
+            int32_t v = (int32_t)(((int64_t)fy * fx + (1 << 15)) >> 16);
+
+            // inject the drop into both time states
+            ripple_grid[0][y][x] += v;
+            ripple_grid[1][y][x] += v;
+        }
+    }
+}
+
+static void ripple_step(void) {
+    int32_t(*z)[RIPPLE_W] = ripple_grid[ripple_cur];
+    int32_t(*z_prev)[RIPPLE_W] = ripple_grid[ripple_cur ^ 1];
+
+    for (uint8_t y = 1; y < RIPPLE_H - 1; y++) {
+        for (uint8_t x = 1; x < RIPPLE_W - 1; x++) {
+            int32_t u = z[y][x];
+            int32_t lap = z[y - 1][x] + z[y + 1][x] + z[y][x - 1] + z[y][x + 1] - 4 * u;
+
+            // (2u - z_prev + r * lap) * damping
+            int64_t next = (int64_t)(2 * u - z_prev[y][x]) * 65536 + (int64_t)RIPPLE_R * lap;
+            z_prev[y][x] = (int32_t)((next * RIPPLE_DAMPING + (1LL << 31)) >> 32);
+        }
+    }
+
+    ripple_cur ^= 1;
+}
+
+bool ripple(effect_params_t *params) {
+    RGB_MATRIX_USE_LIMITS(led_min, led_max);
+
+    // a frame is rendered over several iterations; only advance the simulation on the first
+    if (params->iter == 0) {
+        if (params->init) {
+            memset(ripple_grid, 0, sizeof(ripple_grid));
+            ripple_last_ms = g_rgb_timer;
+            ripple_acc = 0;
+        }
+
+        uint8_t pending[RIPPLE_MAX_PENDING];
+        k_spinlock_key_t key = k_spin_lock(&ripple_lock);
+        uint8_t count = params->init ? 0 : ripple_pending_count;
+        memcpy(pending, ripple_pending, count);
+        ripple_pending_count = 0;
+        k_spin_unlock(&ripple_lock, key);
+
+        for (uint8_t i = 0; i < count; i++) {
+            ripple_add_drop(pending[i]);
+        }
+
+        // step budget in 1/256 ms
+        uint32_t elapsed = MIN(g_rgb_timer - ripple_last_ms, RIPPLE_MAX_CATCHUP_MS);
+        ripple_last_ms = g_rgb_timer;
+        ripple_acc += elapsed * (rgb_matrix_config.speed + 129);
+        while (ripple_acc >= RIPPLE_STEP_MS * 256) {
+            ripple_step();
+            ripple_acc -= RIPPLE_STEP_MS * 256;
+        }
+    }
+
+    for (uint8_t i = led_min; i < led_max; i++) {
+        RGB_MATRIX_TEST_LED_FLAGS();
+
+        // mean of the key-sized block around the LED like downsample() in Tina's implementation 
+        uint8_t cx, cy;
+        ripple_led_corner(i, &cx, &cy);
+        int32_t sum = 0;
+        for (uint8_t y = cy - RIPPLE_K / 2; y < cy + RIPPLE_K / 2; y++) {
+            for (uint8_t x = cx - RIPPLE_K / 2; x < cx + RIPPLE_K / 2; x++) {
+                sum += ripple_grid[ripple_cur][y][x];
+            }
+        }
+        int32_t z = sum / (RIPPLE_K * RIPPLE_K);
+
+        // diverging like the RdBu colormap
+        HSV hsv = rgb_matrix_config.hsv;
+        if (z < 0) {
+            hsv.h += 128;
+        }
+        uint32_t level = MIN((uint32_t)abs(z), (uint32_t)RIPPLE_FULL_SCALE);
+        hsv.v = scale8(level * UINT8_MAX / RIPPLE_FULL_SCALE, hsv.v);
+
+        RGB rgb = rgb_matrix_hsv_to_rgb(hsv);
+        zmk_rgb_matrix_set_color(i, rgb.r, rgb.g, rgb.b);
     }
 
     return zmk_rgb_matrix_check_finished_leds(led_max);
