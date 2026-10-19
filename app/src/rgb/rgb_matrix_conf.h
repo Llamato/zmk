@@ -31,6 +31,7 @@
 #define ENABLE_RGB_EFFECT_WAVES //25
 #endif
 #define ENABLE_RGB_EFFECT_RIPPLE // 26
+#define ENABLE_RGB_EFFECT_SNAKE  // 27
 // #define ENABLE_RGB_EFFECT_RUN                       //23
 
 enum rgb_effects {
@@ -112,6 +113,9 @@ enum rgb_effects {
 #endif
 #ifdef ENABLE_RGB_EFFECT_RIPPLE
     RGB_EFFECT_RIPPLE,
+#endif
+#ifdef ENABLE_RGB_EFFECT_SNAKE
+    RGB_EFFECT_SNAKE,
 #endif
 
 #ifdef ENABLE_RGB_EFFECT_RUN

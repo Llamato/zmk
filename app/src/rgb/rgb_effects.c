@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <zephyr/logging/log.h>
 #include <zmk/leds.h>
+#include <zmk/event_manager.h>
+#include <zmk/events/keycode_state_changed.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 bool rgb_effect_none(effect_params_t *params);
@@ -30,6 +32,7 @@ bool splash(effect_params_t *params);
 bool solid_splash(effect_params_t *params);
 bool waves(effect_params_t *params);
 bool ripple(effect_params_t *params);
+bool snake(effect_params_t *params);
 bool rgb_run(effect_params_t *params);
 bool solid_color(effect_params_t *params);
 bool led_eff_indicators(effect_params_t *params);
@@ -126,6 +129,9 @@ rgb_effect_func rgb_effect_funcs[] = {
 
 #ifdef ENABLE_RGB_EFFECT_RIPPLE
     ripple,
+#endif
+#ifdef ENABLE_RGB_EFFECT_SNAKE
+    snake,
 #endif
 
 #ifdef ENABLE_RGB_EFFECT_RUN
@@ -1027,6 +1033,169 @@ bool ripple(effect_params_t *params) {
         }
         uint32_t level = MIN((uint32_t)abs(z), (uint32_t)RIPPLE_FULL_SCALE);
         hsv.v = scale8(level * UINT8_MAX / RIPPLE_FULL_SCALE, hsv.v);
+
+        RGB rgb = rgb_matrix_hsv_to_rgb(hsv);
+        zmk_rgb_matrix_set_color(i, rgb.r, rgb.g, rgb.b);
+    }
+
+    return zmk_rgb_matrix_check_finished_leds(led_max);
+}
+#endif
+
+#ifdef ENABLE_RGB_EFFECT_SNAKE
+// snake on the key matrix: the arrow keys steer the snake while still being sent to the host,
+// the rgb speed setting sets how fast it moves and the body length is the score. The rules
+// live in snake_game.h (no zephyr, no leds) so tests/snake_sim.c can exercise them on a host.
+#include "snake_game.h"
+
+#define SNAKE_ROWS MATRIX_ROWS
+#define SNAKE_COLS MATRIX_COLS
+#define SNAKE_CELLS (SNAKE_ROWS * SNAKE_COLS)
+#define SNAKE_NO_CELL 0xFF // led is not under a key
+
+#define SNAKE_STEP_MS_SLOW 1400 // rgb speed 0
+#define SNAKE_STEP_MS_FAST 450  // rgb speed 255
+#define SNAKE_GAME_OVER_MS 2500 // corpse fades out for this long, then it respawns
+#define SNAKE_BODY_FADE 160     // how much dimmer the tail is than the head
+#define SNAKE_HUE_STEP 3        // hue shift per body segment
+
+// 0 = the walls are deadly, 1 = the board wraps around
+#define SNAKE_WRAP 1
+
+BUILD_ASSERT(SNAKE_CELLS <= SNAKE_GAME_MAX_CELLS, "snake matrix cells must fit in a uint8_t");
+
+// the arrow keys arrive on the kscan work queue, the game itself runs on the rgb thread
+static struct k_spinlock snake_lock;
+
+static snake_game_t snake_game;
+static uint8_t snake_led_cell[RGB_MATRIX_LED_COUNT]; // led index -> cell
+static uint8_t snake_cell_led[SNAKE_CELLS];          // cell -> led index
+
+// which cells of the matrix have a led under them, and how leds and cells map
+// onto each other. the dark cells are gaps the snake slides over.
+static void snake_map_board(void) {
+    memset(snake_led_cell, SNAKE_NO_CELL, sizeof(snake_led_cell));
+    memset(snake_cell_led, NO_LED, sizeof(snake_cell_led));
+
+    snake_game_init(&snake_game, SNAKE_ROWS, SNAKE_COLS, SNAKE_WRAP);
+    snake_game.game_over_ms = SNAKE_GAME_OVER_MS;
+
+    for (uint8_t row = 0; row < SNAKE_ROWS; row++) {
+        for (uint8_t col = 0; col < SNAKE_COLS; col++) {
+            uint8_t led = g_led_config.matrix_co[row][col];
+            bool lit = led != NO_LED && led < RGB_MATRIX_LED_COUNT;
+
+            snake_game_set_lit(&snake_game, row, col, lit);
+            if (!lit) {
+                continue;
+            }
+
+            uint8_t cell = row * SNAKE_COLS + col;
+            snake_led_cell[led] = cell;
+            snake_cell_led[cell] = led;
+        }
+    }
+}
+
+static uint16_t snake_step_ms(void) {
+    return SNAKE_STEP_MS_SLOW -
+           (uint16_t)(SNAKE_STEP_MS_SLOW - SNAKE_STEP_MS_FAST) * rgb_matrix_config.speed / 255;
+}
+
+static int snake_keycode_listener(const zmk_event_t *eh) {
+    struct zmk_keycode_state_changed *ev = as_zmk_keycode_state_changed(eh);
+    if (!ev || !ev->state || ev->usage_page != HID_USAGE_KEY) {
+        return 0;
+    }
+
+    uint8_t dir;
+    switch (ev->keycode) {
+    case HID_USAGE_KEY_KEYBOARD_UPARROW:
+        dir = SNAKE_GAME_DIR_UP;
+        break;
+    case HID_USAGE_KEY_KEYBOARD_DOWNARROW:
+        dir = SNAKE_GAME_DIR_DOWN;
+        break;
+    case HID_USAGE_KEY_KEYBOARD_LEFTARROW:
+        dir = SNAKE_GAME_DIR_LEFT;
+        break;
+    case HID_USAGE_KEY_KEYBOARD_RIGHTARROW:
+        dir = SNAKE_GAME_DIR_RIGHT;
+        break;
+    default:
+        return 0;
+    }
+
+    k_spinlock_key_t key = k_spin_lock(&snake_lock);
+    snake_game_turn(&snake_game, dir); // any arrow also restarts a finished game
+    k_spin_unlock(&snake_lock, key);
+
+    // the arrows are never captured, they still reach the host
+    return 0;
+}
+
+ZMK_LISTENER(rgb_snake, snake_keycode_listener);
+ZMK_SUBSCRIPTION(rgb_snake, zmk_keycode_state_changed);
+
+bool snake(effect_params_t *params) {
+    RGB_MATRIX_USE_LIMITS(led_min, led_max);
+
+    if (params->init) {
+        snake_map_board();
+        snake_game_reset(&snake_game, g_rgb_timer);
+        zmk_rgb_matrix_set_color_all(0, 0, 0);
+    }
+
+    snake_game.step_ms = snake_step_ms();
+
+    if (params->iter == 0) {
+        // a frame is rendered over several iterations, the game only advances once per frame
+        k_spinlock_key_t key = k_spin_lock(&snake_lock);
+        bool was_alive = snake_game.alive;
+        snake_game_tick(&snake_game, g_rgb_timer);
+        uint8_t score = snake_game.score;
+        k_spin_unlock(&snake_lock, key);
+
+        if (was_alive && !snake_game.alive) {
+            LOG_WRN("snake game over at score %u", score);
+        }
+    }
+
+    // only the snake and its food are lit: the head keeps the configured colour,
+    // the body fades towards the tail, the food pulses, and a dead snake fades
+    // out in red instead of strobing the whole board
+    HSV base = rgb_matrix_config.hsv;
+    bool alive = snake_game.alive;
+    uint8_t corpse = alive
+                         ? 255
+                         : (uint8_t)(255 - snake_game_dead_for(&snake_game, g_rgb_timer) * 255 /
+                                     snake_game.game_over_ms);
+
+    for (uint8_t i = led_min; i < led_max; i++) {
+        RGB_MATRIX_TEST_LED_FLAGS();
+
+        HSV hsv = base;
+        hsv.v = 0;
+
+        uint8_t cell = snake_led_cell[i];
+        uint8_t pos = snake_game_pos_of(&snake_game, cell);
+
+        if (pos != SNAKE_GAME_NO_CELL) {
+            uint8_t taper = (uint8_t)(255 - (uint16_t)pos * SNAKE_BODY_FADE / snake_game.len);
+            if (alive) {
+                if (pos > 0) {
+                    hsv.h += (uint8_t)(pos * SNAKE_HUE_STEP);
+                    hsv.v = scale8(base.v, taper);
+                }
+            } else {
+                hsv.h = 0;
+                hsv.s = UINT8_MAX;
+                hsv.v = scale8(base.v, (uint8_t)((uint16_t)corpse * taper / 255));
+            }
+        } else if (alive && cell != SNAKE_NO_CELL && snake_game_is_food(&snake_game, cell)) {
+            hsv.h += 128;
+            hsv.v = scale8(base.v, 96 + sin8((uint8_t)(g_rgb_timer >> 2)) / 2);
+        }
 
         RGB rgb = rgb_matrix_hsv_to_rgb(hsv);
         zmk_rgb_matrix_set_color(i, rgb.r, rgb.g, rgb.b);
