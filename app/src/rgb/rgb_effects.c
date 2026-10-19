@@ -1028,12 +1028,20 @@ bool ripple(effect_params_t *params) {
 
         // diverging like the RdBu colormap
         HSV hsv = rgb_matrix_config.hsv;
+        if (z > 0) {
+            hsv.h = 247;
+            hsv.s = 22;
+        }
+        if(z == 0) {
+            hsv.v = UINT8_MAX;
+        }
         if (z < 0) {
-            hsv.h += 128;
+            hsv.h = 140;
+            hsv.s = 46;
         }
         uint32_t level = MIN((uint32_t)abs(z), (uint32_t)RIPPLE_FULL_SCALE);
         hsv.v = scale8(level * UINT8_MAX / RIPPLE_FULL_SCALE, hsv.v);
-
+        
         RGB rgb = rgb_matrix_hsv_to_rgb(hsv);
         zmk_rgb_matrix_set_color(i, rgb.r, rgb.g, rgb.b);
     }
